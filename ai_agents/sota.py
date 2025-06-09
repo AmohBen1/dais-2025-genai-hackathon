@@ -6,6 +6,8 @@
 import os
 import time
 import pandas as pd
+import logging
+from functools import wraps
 from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, MessagesPlaceholder, PromptTemplate
 from langchain.chat_models import ChatDatabricks
 from langchain.schema.output_parser import StrOutputParser
@@ -28,7 +30,7 @@ w = WorkspaceClient()
 os.environ["DATABRICKS_HOST"] = w.config.host
 os.environ["DATABRICKS_TOKEN"] = w.tokens.create(
     comment="for model serving", 
-    lifetime_seconds=120000
+    lifetime_seconds=12000
 ).token_value
 
 llm = ChatDatabricks(endpoint="databricks-llama-4-maverick")
@@ -42,111 +44,54 @@ class AccessibilityAgent:
             k = 5
         )
         self.spark = None
-        self.max_retries = 3
-        self.retry_delay = 2  # seconds
-        self._initialize_spark()
+        self.max_retries = 2
+        self.retry_delay = 1  # seconds
         self.tools = self._create_tools()
         self.agent = self._create_agent()
 
-    def _initialize_spark(self):
-            """Initialize or reinitialize Spark session"""
-            try:
-                # Try to get existing Spark session
-                self.spark = SparkSession.getActiveSession()
-                if self.spark is None:
-                    # Create new Spark session if none exists
-                    self.spark = SparkSession.builder \
-                        .appName("AccessibilityAgent") \
-                        .getOrCreate()
-                
-                # Test the session
-                self.spark.sql("SELECT 1").collect()
-                print("✅ Spark session initialized successfully")
-                
-            except Exception as e:
-                print(f"❌ Failed to initialize Spark session: {e}")
-                self.spark = None
+    def _is_session_error(self, error):
+        """Detect if error is related to session/connection issues"""
+        error_str = str(error).lower()
+        session_keywords = [
+            'session_id is no longer usable',
+            'inactivity_timeout', 
+            'failed_precondition',
+            'grpc error',
+            'inactive_rpc_error',
+            'connection closed',
+            'bad_request: session_id'
+        ]
+        return any(keyword in error_str for keyword in session_keywords)
 
-    def _restart_spark_session(self):
-        """Restart the Spark session"""
-        print("🔄 Attempting to restart Spark session...")
+    def _execute_with_smart_retry(self, operation_func, operation_name="operation", *args, **kwargs):
+        """Execute any operation with smart retry logic"""
+        last_error = None
         
-        try:
-            # Stop existing session if it exists
-            if self.spark:
-                try:
-                    self.spark.stop()
-                except:
-                    pass  # Ignore errors when stopping
-            
-            # Wait a moment
-            time.sleep(self.retry_delay)
-            
-            # Create new session
-            self.spark = SparkSession.builder \
-                .appName("AccessibilityAgent") \
-                .config("spark.sql.adaptive.enabled", "true") \
-                .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
-                .getOrCreate()
-            
-            # Test the new session
-            self.spark.sql("SELECT 1").collect()
-            print("✅ Spark session restarted successfully")
-            return True
-            
-        except Exception as e:
-            print(f"❌ Failed to restart Spark session: {e}")
-            self.spark = None
-            return False
-        
-    def _execute_with_retry(self, sql_query: str, operation_name: str = "SQL query"):
-        """Execute SQL with automatic retry on session timeout"""
-        
-        for attempt in range(self.max_retries):
+        for attempt in range(self.max_retries + 1):
             try:
-                if self.spark is None:
-                    if not self._restart_spark_session():
-                        raise Exception("Failed to initialize Spark session")
-                
-                # Try to execute the query
-                result_df = self.spark.sql(sql_query).toPandas()
-                return result_df
+                return operation_func(*args, **kwargs)
                 
             except Exception as e:
-                error_str = str(e).lower()
+                last_error = e
                 
-                # Check if it's a session timeout error
-                if any(keyword in error_str for keyword in [
-                    "session_id is no longer usable", 
-                    "inactivity_timeout",
-                    "failed_precondition",
-                    "session expired"
-                ]):
-                    print(f"⚠️ Session timeout detected on attempt {attempt + 1}")
-                    
-                    if attempt < self.max_retries - 1:  # Not the last attempt
-                        print(f"🔄 Retrying {operation_name} (attempt {attempt + 2}/{self.max_retries})...")
-                        
-                        # Try to restart session
-                        if self._restart_spark_session():
-                            time.sleep(self.retry_delay)
-                            continue
-                        else:
-                            print("❌ Failed to restart session, trying next attempt...")
-                            continue
+                if self._is_session_error(e):
+                    if attempt < self.max_retries:
+                        delay = self.base_delay * (2 ** attempt)  # Exponential backoff
+                        print(f"⚠️ Session error detected in {operation_name} (attempt {attempt + 1}). Retrying in {delay}s...")
+                        time.sleep(delay)
+                        continue
                     else:
-                        # Last attempt failed
-                        return self._handle_session_failure(sql_query, operation_name)
+                        return self._format_session_error_message(str(e), operation_name)
                 else:
-                    # Not a session error, re-raise
+                    # Not a session error, don't retry
                     raise e
         
-        # If we get here, all retries failed
-        return self._handle_session_failure(sql_query, operation_name)
-    
-    def _handle_session_failure(self, sql_query: str, operation_name: str):
-        """Handle the case where session restart fails"""
-        return 
+        # All retries failed
+        return self._format_session_error_message(str(last_error), operation_name)
+        
+    def _format_session_error_message(self, error_details, operation_name="operation"):
+        """Provide helpful error message when session fails"""
+        return f"""**Spark Session Connection Lost{operation_name}**"""
     
     def _create_tools(self) -> List[Tool]:
         """Create a comprehensive tool for the AI agent"""
@@ -190,6 +135,24 @@ class AccessibilityAgent:
         ]
         return tools
     
+    def _test_spark_connection(self):
+        """Test if Spark is working with a simple query"""
+        try:
+            result = spark.sql("SELECT 1 as connection_test").collect()
+            return True, "Connection OK"
+        except Exception as e:
+            return False, str(e)
+
+    def _execute_sql_operation(self, sql_query):
+        """Execute SQL operation - this is what gets retried"""
+        # First test connection
+        is_connected, status = self._test_spark_connection()
+        if not is_connected:
+            raise Exception(f"Spark connection failed: {status}")
+        
+        # Execute the actual query
+        return spark.sql(sql_query).to_pandas_on_spark()
+    
     def _generate_and_execute_sql(self, user_request: str) -> str:
         """Generate SQL queries based on natural language and execute them"""
 
@@ -200,7 +163,7 @@ class AccessibilityAgent:
             - listing name, location, location_details, details, description, description_by_sections, reviews
             - host_name_of_reviews, guest_rating, price, amenities, property_type, beds, bedrooms, bathrooms, property_number_of_reviews, host, highlights, discount,is_supperhost, pricing_detials, reviews, travel_details,house_rules
 
-            Table: sota_ai_agents.bright_initiative.airbnb_properties_information
+            Table: sota_ai_agents.bright_initiative.airbnb_properties_information_csv
         
             User request: {request}
         
@@ -221,8 +184,11 @@ class AccessibilityAgent:
             sql_query = sql_query.strip()
 
             # Execute the generated SQL
-            # Execute with auto-retry
-            result_df = self._execute_with_retry(sql_query, "SQL query execution")
+            result_df = self._execute_with_smart_retry(
+            self._execute_sql_operation, 
+            "SQL execution",
+            sql_query
+        )
             
             # Check if we got an error message instead of DataFrame
             if isinstance(result_df, str):
@@ -244,13 +210,13 @@ class AccessibilityAgent:
         SELECT 
             listing_name,
             description
-        FROM sota_ai_agents.bright_initiative.airbnb_properties_information
+        FROM sota_ai_agents.bright_initiative.airbnb_properties_information_csv
         WHERE property_id = '{property_id}'
         LIMIT 1
         """
         
         try:
-            result_df = spark.sql(query).toPandas()
+            result_df = spark.sql(query).to_pandas_on_spark()
             return self._format_context(result_df)
         except Exception as e:
             return f"Property description not available: {str(e)}"
@@ -270,7 +236,7 @@ class AccessibilityAgent:
             """
             
             try:
-                result_df = spark.sql(query).toPandas()
+                result_df = spark.sql(query).to_pandas_on_spark()
                 return self._format_context(result_df)
             except Exception as e:
                 return f"Property reviews not available: {str(e)}"
@@ -307,7 +273,7 @@ class AccessibilityAgent:
 
         try:
             # Execute the SQL query
-            results_df = spark.sql(sql_query).toPandas()
+            results_df = spark.sql(sql_query).to_pandas_on_spark()
             # Convert the results to a list of dictionaries
             results_list = results_df.to_dict(orient='records')
             # Return the results as a JSON string
@@ -332,7 +298,7 @@ class AccessibilityAgent:
         """
         
         try:
-            result_df = spark.sql(query).toPandas()
+            result_df = spark.sql(query).to_pandas_on_spark()
             return self._format_context(result_df)
         except Exception as e:
             return f"Neighborhood data not available: {str(e)}"
@@ -353,11 +319,14 @@ class AccessibilityAgent:
         """
         
         try:
-            result_df = spark.sql(query).toPandas()
+            result_df = spark.sql(query).to_pandas_on_spark()
             return self._format_context(result_df)
         except Exception as e:
             return f"Neighborhood data not available: {str(e)}"
-
+        
+    def _advanced_search_operation(self, sql_query):
+        """Advanced search operation - this is what gets retried"""
+        return spark.sql(sql_query).to_pandas_on_spark()
 
     def _advanced_search(self, criteria: str) -> str:
         """Perform advanced search with multiple criteria"""
@@ -369,7 +338,7 @@ class AccessibilityAgent:
         Criteria: {criteria}
         
         Use these tables:
-        - airbnb_properties_information
+        - airbnb_properties_information_csv
         - neighborhood_accessibility  
         - reviews_sentiment_analysis
         
@@ -391,7 +360,11 @@ class AccessibilityAgent:
             print(f"🔍 Generated advanced search SQL: {sql_query}")
             
             # Execute with auto-retry
-            result_df = self._execute_with_retry(sql_query, "Advanced search")
+            result_df = self._execute_with_smart_retry(
+            self._advanced_search_operation,
+            "Advanced search",
+            sql_query
+            )
             
             if isinstance(result_df, str):
                 return result_df
